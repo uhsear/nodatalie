@@ -40,6 +40,7 @@ import json
 import math
 import os
 import shutil
+import statistics
 import struct
 import sys
 import tempfile
@@ -176,9 +177,17 @@ def scan_cells(chunks, nodata, can_nan):
     return Scan(valid, nodata, hits, nans, total)
 
 
-def close(a, b, tol):
-    """Equal within a relative tolerance, with a floor of 1.0 on the scale."""
-    return a == b or abs(a - b) <= tol * max(1.0, abs(a), abs(b))
+def close(a, b, tol, floor=1.0):
+    """Equal within a relative tolerance, with a floor on the scale.
+
+    An infinite or NaN number matches only itself (inf is never close to a
+    finite number, and NaN matches nothing).
+    """
+    if a == b:
+        return True
+    if not (math.isfinite(a) and math.isfinite(b)):
+        return False
+    return abs(a - b) <= tol * max(floor, abs(a), abs(b))
 
 
 def valid_percent_text(valid, total):
@@ -211,10 +220,18 @@ def _g(x):
 
 
 def _mismatches(stored, summary, vpct, tol):
-    """(name, stored, other) for each stored number that disagrees."""
+    """(name, stored, other) for each stored number that disagrees.
+
+    The smallest scale a gap is measured against is the data range, so the
+    tolerance follows the size of the values: a mean near zero does not fail
+    on noise, and a raster of tiny values is not compared against a fixed 1.0.
+    """
     out = []
+    floor = summary["max"] - summary["min"]
+    if not math.isfinite(floor):
+        floor = 0.0
     for key, name in STAT_KEYS:
-        if key in stored and not close(stored[key], summary[name], tol):
+        if key in stored and not close(stored[key], summary[name], tol, floor):
             out.append((name, stored[key], summary[name]))
     if K_VALID in stored and abs(stored[K_VALID] - vpct) > VALID_PCT_TOL:
         out.append(("valid_percent", stored[K_VALID], vpct))
@@ -260,9 +277,20 @@ def judge(scan, stored, approx, tol=DEFAULT_TOL, require_stats=False,
                 text = "stored statistics differ from the cells: " + "; ".join(
                     "%s stored %s, recomputed %s" % (name, _g(s), _g(r))
                     for name, s, r in bad)
-            if approx:
+            severity = FAIL
+            if approx and code == "STATS_COUNT_NODATA":
+                text += (" (flagged approximate, but they equal the statistics"
+                         " of every cell, so they were not sampled)")
+            elif approx and any((name == "min" and s < r)
+                                or (name == "max" and s > r)
+                                for name, s, r in bad):
+                text += (" (flagged approximate, but a sampled minimum cannot"
+                         " lie below the real minimum nor a sampled maximum"
+                         " above the real maximum)")
+            elif approx:
+                severity = WARN
                 text += " (stored statistics are flagged approximate)"
-            add(code, WARN if approx else FAIL, text)
+            add(code, severity, text)
     if scan.nd_hits and rec["min"] < scan.nodata < rec["max"]:
         add("NODATA_INSIDE_RANGE", WARN,
             "NoData value %s lies inside the data range %s..%s and masks %d "
@@ -843,6 +871,20 @@ def apply_one(path, report, tol, require_stats):
         if side:
             again = check_file(path, tol, require_stats)
             again["apply"] = reason
+            if any(f["code"] == "STATS_COUNT_NODATA"
+                   for f in report["findings"]):
+                # The tool cannot tell a late NoData value from one that
+                # masks real cells, so the refresh must not read as clean.
+                again["findings"].append({
+                    "code": "NODATA_ASSUMED", "severity": WARN,
+                    "message": "--apply took the declared NoData value %s as "
+                               "right and left its %d cells out of the new "
+                               "statistics: if they are real data, clear the "
+                               "NoData value and recompute (the old sidecar, "
+                               "if there was one, is in the .nodatalie.bak "
+                               "copy)" % (_g(report["nodata"]),
+                                            report["nodata_cells"])})
+                again["verdict"] = verdict_of(again["findings"])
             return again
     report["apply"] = "not refreshed: " + reason
     return report
@@ -924,8 +966,9 @@ def main(argv=None):
         print("error: give a raster or a folder. Use --self-test to verify "
               "the tool without data.", file=sys.stderr)
         return 64
-    if args.tol < 0:
-        print("error: --tol cannot be negative.", file=sys.stderr)
+    if not (args.tol >= 0 and math.isfinite(args.tol)):
+        print("error: --tol must be a finite number, zero or more.",
+              file=sys.stderr)
         return 64
     files, missing = collect(args.paths)
     for path in missing:
@@ -1235,6 +1278,35 @@ def self_test():
     check(parts[0] == 6 and approx(parts[1], whole[1])
           and approx(parts[2], whole[2]) and parts[3:] == (2, 100),
           "two halves merge to the whole")
+    # Hand-worked numbers and the standard library, not this file's own
+    # helpers, so a wrong formula cannot agree with itself.
+    gold = summarize(acc_of([2, 4, 4, 4, 5, 5, 7, 9]))
+    check(gold == {"min": 2.0, "max": 9.0, "mean": 5.0, "std": 2.0},
+          "min, max, mean and deviation of a hand-worked set"
+          "  <-- pinned defect")
+    zero = acc_merge(acc_of([0, 0]), acc_of([6]))
+    check(zero[0] == 3 and approx(zero[1], 2.0) and approx(zero[2], 24.0),
+          "a chunk whose mean is 0 is merged, not dropped  <-- pinned defect")
+    low = acc_merge(acc_of([1, 9]), acc_of([5, 6]))
+    check(low[3] == 1 and low[4] == 9,
+          "the merged minimum is the smaller minimum  <-- pinned defect")
+    low = acc_merge(acc_of([5, 6]), acc_of([1, 9]))
+    check(low[3] == 1 and low[4] == 9, "the merged maximum is the larger one")
+    walk = []
+    seed_v = 7
+    for _i in range(240):
+        seed_v = (seed_v * 1103515245 + 12345) & 0x7FFFFFFF
+        walk.append(((seed_v >> 8) % 20001) / 10.0 - 1000.0)
+    one = summarize(acc_of(walk))
+    three = summarize(acc_merge(acc_merge(acc_of(walk[:50]),
+                                          acc_of(walk[50:51])),
+                                acc_of(walk[51:])))
+    check(approx(one["mean"], statistics.fmean(walk))
+          and approx(one["std"], statistics.pstdev(walk))
+          and one["min"] == min(walk) and one["max"] == max(walk),
+          "240 values agree with the standard library")
+    check(all(approx(three[k], one[k]) for k in one),
+          "a three way merge, one part a single value, agrees with one pass")
 
     # ---- the scan: NoData, NaN and the unmasked view
     scan = scan_cells([[1, 2, -9999.0], [float("nan"), 4, 6]], -9999.0, True)
@@ -1263,6 +1335,17 @@ def self_test():
     check(close(0.0, 1e-9, 1e-6), "the scale floor stops a tiny mean failing")
     check(close(float("inf"), float("inf"), 1e-6), "equal infinities match")
     check(not close(float("nan"), 1.0, 1e-6), "NaN matches nothing")
+    check(not close(float("inf"), 5.0, 1e-6)
+          and not close(5.0, float("inf"), 1e6)
+          and not close(float("-inf"), float("inf"), 1e6),
+          "an infinity is never close to a finite number or its opposite"
+          "  <-- pinned defect")
+    check(close(0.0, 1.0, 1.0) and not close(0.0, 1.0, 0.99),
+          "a gap exactly at the tolerance is accepted, one past it is not")
+    check(not close(0.0, 1.5e-6, 1e-6) and close(0.0, 1.5e-6, 1e-6, 2.0),
+          "the floor is the scale used when both numbers are small")
+    check(not close(0.0, 1e-9, 1e-6, 0.0),
+          "a floor of 0 leaves a purely relative tolerance")
     check(valid_percent_text(0, 10) == "0", "no valid cell is 0 percent")
     check(valid_percent_text(10, 10) == "100", "all valid is 100 percent")
     check(valid_percent_text(2, 3) == "66.67", "two thirds is 66.67")
@@ -1281,6 +1364,12 @@ def self_test():
           "NaN cannot equal an integer cell")
     check(nodata_problem(float("-inf"), (0, 255)) is not None,
           "infinity cannot equal an integer cell")
+    check(nodata_problem(127.0, (-128, 127)) is None
+          and nodata_problem(-128.0, (-128, 127)) is None,
+          "both ends of the int8 range are valid NoData values")
+    check(nodata_problem(128.0, (-128, 127)) is not None
+          and nodata_problem(-129.0, (-128, 127)) is not None,
+          "one past either end of int8 is not")
 
     # ---- judge: the gate itself
     cells = [10, 12, 14, 16, 11, 15, 17, 12, 14, 18]
@@ -1316,12 +1405,37 @@ def self_test():
     check(found_codes(found) == ["STATS_COUNT_NODATA"],
           "a valid percent of 100 over a masked raster counted the NoData")
     rec, found = judge(scan, counted, True)
-    check(found[0]["severity"] == WARN
+    check(found_codes(found) == ["STATS_COUNT_NODATA"]
+          and found[0]["severity"] == FAIL
+          and "were not sampled" in found[0]["message"],
+          "approximate statistics that equal the full scan, NoData counted, "
+          "still fail  <-- pinned defect")
+    mid = scan_cells([[-5, 0, 0, 9, 40]], 0, False)
+    wide_all = summarize(mid.unmasked())
+    rec, found = judge(mid, {K_MIN: wide_all["min"], K_MAX: wide_all["max"],
+                              K_MEAN: wide_all["mean"], K_STD: wide_all["std"],
+                              K_VALID: 100.0}, True)
+    check(found[0]["code"] == "STATS_COUNT_NODATA"
+          and found[0]["severity"] == FAIL,
+          "approximate statistics of every cell fail even when the NoData "
+          "value sits inside the range")
+    rec, found = judge(scan, dict(good, STATISTICS_MINIMUM=-9999.0), True)
+    check(found[0]["code"] == "STALE_STATS" and found[0]["severity"] == FAIL
+          and "cannot lie below" in found[0]["message"],
+          "an approximate minimum below the real minimum fails, as sampling "
+          "cannot do that  <-- pinned defect")
+    rec, found = judge(scan, dict(good, STATISTICS_MAXIMUM=99999.0), True)
+    check(found[0]["severity"] == FAIL and "above the real maximum"
+          in found[0]["message"],
+          "an approximate maximum above the real maximum fails")
+    rec, found = judge(scan, dict(good, STATISTICS_MINIMUM=12.0,
+                                  STATISTICS_MAXIMUM=16.0), True)
+    check(found[0]["code"] == "STALE_STATS" and found[0]["severity"] == WARN
           and "flagged approximate" in found[0]["message"],
-          "approximate statistics warn instead of failing")
+          "an approximate range inside the real range warns, as a sample can")
     rec, found = judge(scan, dict(good, STATISTICS_STDDEV=5.0), True)
     check(found[0]["code"] == "STALE_STATS" and found[0]["severity"] == WARN,
-          "a stale approximate set warns")
+          "a stale approximate deviation warns")
     sample_std = math.sqrt(acc_of([c for c in masked if c != -9999])[2] / 9.0)
     rec, found = judge(scan, dict(good, STATISTICS_STDDEV=sample_std), False)
     check(found_codes(found) == ["STALE_STATS"],
@@ -1361,6 +1475,44 @@ def self_test():
     unused = scan_cells([[1, 9]], 5, False)
     rec, found = judge(unused, stats_of(unused), False)
     check(found == [], "a NoData value no cell uses masks nothing")
+    check(judge(wide, stats_of(wide), False)[1][0]["severity"] == WARN,
+          "a NoData value inside the range warns and does not fail")
+
+    # ---- the scale a gap is measured against follows the data
+    tiny = scan_cells([[1e-10 * k for k in range(1, 31)]], None, False)
+    tiny_good = stats_of(tiny)
+    check(judge(tiny, tiny_good, False)[1] == [],
+          "correct statistics of tiny values pass")
+    big_stored = dict((k, v * 1000.0) for k, v in tiny_good.items())
+    big_stored[K_VALID] = 100.0
+    rec, found = judge(tiny, big_stored, False)
+    check(found_codes(found) == ["STALE_STATS"] and found[0]["severity"] == FAIL,
+          "statistics 1000 times too large for a raster of tiny values fail"
+          "  <-- pinned defect")
+    tiny_nd = scan_cells([[1e-8, 2e-8, 3e-8, 0.0, 5e-8]], 0.0, False)
+    counted_nd = good_items([1e-8, 2e-8, 3e-8, 0.0, 5e-8])
+    del counted_nd[K_VALID]
+    rec, found = judge(tiny_nd, dict((k, float(v)) for k, v
+                                     in counted_nd.items()), False)
+    check(found_codes(found) == ["STATS_COUNT_NODATA"],
+          "a NoData value set late on tiny values is named, with no valid "
+          "percent to give it away  <-- pinned defect")
+    offset = scan_cells([[1e9, 1e9 + 10, 1e9 + 4, 1e9 + 6]], None, False)
+    twice = stats_of(offset)
+    twice[K_STD] *= 2.0
+    check(found_codes(judge(offset, twice, False)[1]) == ["STALE_STATS"],
+          "a doubled deviation fails even when the values sit near 1e9")
+    flat = scan_cells([[7.0, 7.0, 7.0]], None, False)
+    check(judge(flat, stats_of(flat), False)[1] == [],
+          "a raster of one value, range 0, passes with correct statistics")
+    check(found_codes(judge(flat, dict(stats_of(flat), STATISTICS_MEAN=7.001),
+                            False)[1]) == ["STALE_STATS"],
+          "and fails when the stored mean is off by a thousandth")
+    inf_scan = scan_cells([[1.0, 2.0, float("inf")]], None, True)
+    check(found_codes(judge(inf_scan, {K_MAX: 3.0, K_MEAN: 2.0}, False)[1])
+          == ["STALE_STATS"],
+          "an infinite cell never passes finite stored numbers (the scale "
+          "stays finite)")
 
     # ---- the LZW codec
     raw_stream = bytes(bytearray(range(256)) * 3)
@@ -1672,6 +1824,42 @@ def self_test():
         check("GDAL_NODATA" in check_file(at("ndword.tif"))["reason"],
               "a NoData tag that is not a number is unreadable")
 
+        # ---- integer ranges, and NoData values at their edges
+        int_ranges = {(1, 8): (0, 255), (2, 8): (-128, 127),
+                      (1, 16): (0, 65535), (2, 16): (-32768, 32767),
+                      (1, 32): (0, 4294967295),
+                      (2, 32): (-2147483648, 2147483647),
+                      (3, 32): None, (3, 64): None}
+        for (fmt, bits), expect in sorted(int_ranges.items()):
+            make_tiff(at("range.tif"), [[1, 2]], bits=bits, fmt=fmt)
+            check(read_tiff(at("range.tif")).int_range == expect,
+                  "sample format %d at %d bits holds %s"
+                  % (fmt, bits, "any number" if expect is None
+                     else "%d..%d" % expect))
+        make_tiff(at("u32nd.tif"), [[1, 2, 4294967295, 4]], bits=32, fmt=1,
+                  nodata="4294967295")
+        rep = check_file(at("u32nd.tif"))
+        check(rep["nodata"] == 4294967295.0 and rep["nodata_cells"] == 1
+              and "NODATA_UNREPRESENTABLE" not in codes(rep),
+              "a uint32 NoData of 4294967295 is kept exact and masks its cell"
+              "  <-- pinned defect")
+        make_tiff(at("i32nd.tif"), [[-2147483648, 5, 6]], bits=32, fmt=2,
+                  nodata="-2147483648")
+        rep = check_file(at("i32nd.tif"))
+        check(rep["nodata"] == -2147483648.0 and rep["nodata_cells"] == 1
+              and "NODATA_UNREPRESENTABLE" not in codes(rep),
+              "an int32 NoData of -2147483648 is kept exact and masks its cell")
+        for text, flagged in (("65535", False), ("65536", True)):
+            make_tiff(at("u16e.tif"), [[1, 2]], bits=16, fmt=1, nodata=text)
+            check(("NODATA_UNREPRESENTABLE" in codes(check_file(at("u16e.tif"))))
+                  == flagged,
+                  "a uint16 file with NoData %s is %sflagged"
+                  % (text, "" if flagged else "not "))
+        make_tiff(at("f32int.tif"), [[1.5, 2.5]], bits=32, fmt=3,
+                  nodata="-9999")
+        check("NODATA_UNREPRESENTABLE" not in codes(check_file(at("f32int.tif"))),
+              "a float raster takes any NoData value")
+
         # ---- unreadable TIFFs, each with its reason
         def broken(name, mutate, needle, label, **kw):
             path = at(name)
@@ -1863,6 +2051,11 @@ def self_test():
               "no path is a usage error that names --self-test")
         check(run([good_dir, "--tol", "-1"])[0] == 64,
               "a negative tolerance is a usage error")
+        for bad_tol in ("nan", "inf", "1e999"):
+            code, out, err = run([good_dir, "--tol", bad_tol])
+            check(code == 64 and "finite" in err,
+                  "--tol %s is a usage error, not a switch that turns the "
+                  "comparison off  <-- pinned defect" % bad_tol)
         check(run([good_dir, "--tol", "x"])[0] == 64,
               "a tolerance that is not a number is a usage error")
         check(run([good_dir, "--tol", "0.5"])[0] == 0,
@@ -1906,6 +2099,8 @@ def self_test():
         make_tiff(wat("alln.tif"), [[0, 0]], bits=16, fmt=2, nodata="0")
         make_tiff(wat("u8bad.tif"), [[1, 2]], bits=8, fmt=1, nodata="-9999")
         make_sidecar(wat("clean.tif"), items)
+        make_tiff(wat("late.tif"), wrows, bits=16, fmt=2, nodata="-9999")
+        make_sidecar(wat("late.tif"), good_items([v for r in wrows for v in r]))
         with open(wat("nobandsidecar.tif.aux.xml"), "w") as handle:
             handle.write('<PAMDataset><PAMRasterBand band="1"><Metadata '
                          'domain="Q"><MDI key="a">b</MDI></Metadata>'
@@ -1928,6 +2123,21 @@ def self_test():
               and not os.path.exists(wat("none.tif.aux.xml") + BAK_SUFFIX),
               "a new sidecar has nothing to back up")
         check(doc["stale.tif"]["verdict"] == OK, "a stale raster passes after")
+        check(doc["late.tif"]["apply"] == "refreshed"
+              and "NODATA_ASSUMED" in codes(doc["late.tif"])
+              and doc["late.tif"]["verdict"] == WARN
+              and "STATS_COUNT_NODATA" not in codes(doc["late.tif"]),
+              "a late NoData value is refreshed, and the refresh still warns "
+              "that the NoData value was taken as right  <-- pinned defect")
+        check("2 cells out of the new statistics"
+              in doc["late.tif"]["findings"][0]["message"],
+              "that warning counts the cells the NoData value left out")
+        check(doc["none.tif"]["findings"] == []
+              and doc["stale.tif"]["findings"] == [],
+              "a no-statistics or stale refresh adds no such warning")
+        code, out, err = run([wat("late.tif")])
+        check(code == 0 and "NODATA_ASSUMED" not in out,
+              "a plain check after the refresh sees consistent numbers")
         check(digest(old_side + BAK_SUFFIX) == old_bytes,
               "the old sidecar was copied byte for byte before the rewrite")
         new_text = digest(old_side).decode("utf-8")
@@ -1989,6 +2199,19 @@ def self_test():
               "a failed write leaves the old sidecar whole")
         check([n for n in os.listdir(wdir) if n.endswith(".tmp")] == [],
               "and removes its temporary file")
+
+        # ---- exit codes after a refresh that took a NoData value as right
+        for name, extra, want_code in (("late_a", [], 0),
+                                       ("late_b", ["--strict"], 1)):
+            ldir = at(name)
+            os.makedirs(ldir)
+            make_tiff(os.path.join(ldir, "l.tif"), wrows, bits=16, fmt=2,
+                      nodata="-9999")
+            make_sidecar(os.path.join(ldir, "l.tif"),
+                         good_items([v for r in wrows for v in r]))
+            check(run([ldir, "--apply"] + extra)[0] == want_code,
+                  "a refresh that took the NoData value as right exits %d%s"
+                  % (want_code, " under --strict" if extra else ""))
 
         # ---- text of the reports
         check(describe({"verdict": UNREADABLE, "path": "p", "reason": "r"})
