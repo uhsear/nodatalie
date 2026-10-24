@@ -24,8 +24,9 @@ strips or tiles, uncompressed, LZW or deflate, in either byte order. Standard
 library only. Nothing is written without --apply, and --apply writes only the
 PAM sidecar, never the raster.
 
-Exit codes: 0 clean, 1 a finding, 2 a raster could not be read or a path is
-missing, 64 usage error.
+Exit codes: 0 clean, 1 a finding, 2 a raster could not be read, a path is
+missing, a folder could not be listed or an --apply write failed, 64 usage
+error.
 """
 
 from __future__ import print_function
@@ -101,8 +102,15 @@ def acc_of(values):
     n = len(values)
     if n == 0:
         return EMPTY
-    mean = math.fsum(values) / n
-    m2 = math.fsum((v - mean) ** 2 for v in values)
+    try:
+        mean = math.fsum(values) / n
+        m2 = math.fsum((v - mean) ** 2 for v in values)
+    except (ValueError, OverflowError):
+        # fsum refuses +inf with -inf, and squaring a cell near 1e154 or more
+        # overflows. No statistic exists, so the raster is unreadable, not clean.
+        raise UnreadableRaster("the cells hold both +inf and -inf, or numbers "
+                               "too large to square: no statistics can be "
+                               "computed")
     return (n, mean, m2, min(values), max(values))
 
 
@@ -126,8 +134,11 @@ def summarize(acc):
     """
     if acc[0] == 0:
         return None
+    # A constant raster has no spread. Merged blocks leave a rounding residue
+    # of about 1e-16 there, and GDAL stores exactly 0.
+    std = 0.0 if acc[3] == acc[4] else math.sqrt(acc[2] / acc[0])
     return {"min": float(acc[3]), "max": float(acc[4]), "mean": float(acc[1]),
-            "std": math.sqrt(acc[2] / acc[0])}
+            "std": std}
 
 
 class Scan(object):
@@ -315,7 +326,7 @@ class Raster(object):
     """A readable raster: size, NoData, a cell iterator and stored numbers."""
 
     def __init__(self, kind, width, height, nodata, can_nan, int_range, raw,
-                 chunks):
+                 chunks, f32=False):
         self.kind = kind
         self.width = width
         self.height = height
@@ -324,6 +335,7 @@ class Raster(object):
         self.int_range = int_range
         self.raw = raw          # stored metadata text by key
         self.chunks = chunks    # callable returning an iterator of cell lists
+        self.f32 = f32          # 32-bit float cells: NoData compares in float32
 
 
 def _parse_float(text, what):
@@ -694,7 +706,8 @@ def read_tiff(path):
     meta = _ascii(tags, 42112)
     raw = {} if meta is None else _gdal_items(meta)
     return Raster("tif", lay["width"], lay["height"], nodata, lay["fmt"] == 3,
-                  int_range, raw, lambda: _tiff_chunks(path, lay))
+                  int_range, raw, lambda: _tiff_chunks(path, lay),
+                  lay["fmt"] == 3 and lay["bits"] == 32)
 
 
 def sidecar_path(path):
@@ -718,12 +731,16 @@ def _mdi(band):
 
 
 def read_sidecar(path):
+    """(stored metadata by key, NoDataValue text or None) of band 1."""
     try:
         root = ET.parse(path).getroot()
     except ET.ParseError as exc:
         raise UnreadableRaster("the sidecar is not XML: %s" % exc)
     band = _band_one(root)
-    return {} if band is None else _mdi(band)
+    if band is None:
+        return {}, None
+    node = band.find("NoDataValue")
+    return _mdi(band), None if node is None else (node.text or "").strip()
 
 
 def open_raster(path):
@@ -736,7 +753,14 @@ def open_raster(path):
     else:
         raise UnreadableRaster("%s files are not read" % (ext or "extensionless"))
     if os.path.exists(sidecar_path(path)):
-        raster.raw.update(read_sidecar(sidecar_path(path)))
+        items, nodata = read_sidecar(sidecar_path(path))
+        raster.raw.update(items)
+        # GDAL lets a GeoTIFF sidecar NoDataValue replace the tag, or stand in
+        # for a missing one (observed, GDAL 3.12.4). An ASCII grid ignores it.
+        if nodata is not None and raster.kind == "tif":
+            raster.nodata = _parse_float(nodata, "sidecar NoDataValue")
+            if raster.f32:
+                raster.nodata = _as_float32(raster.nodata)
     return raster
 
 
@@ -771,11 +795,11 @@ def check_file(path, tol=DEFAULT_TOL, require_stats=False):
 
 
 def collect(paths):
-    """Raster files under the given paths, plus the paths that do not exist."""
-    files, missing = [], []
+    """(rasters, paths that do not exist, folders that could not be listed)."""
+    files, missing, unlisted = [], [], []
     for path in paths:
         if os.path.isdir(path):
-            for dirpath, dirnames, names in os.walk(path):
+            for dirpath, dirnames, names in os.walk(path, onerror=unlisted.append):
                 dirnames.sort()
                 for name in sorted(names):
                     if name.lower().endswith(RASTER_EXT):
@@ -784,7 +808,7 @@ def collect(paths):
             files.append(path)
         else:
             missing.append(path)
-    return files, missing
+    return files, missing, unlisted
 
 
 # ------------------------------------------------------------------- refresh
@@ -863,6 +887,7 @@ def refresh_sidecar(path, report):
 def apply_one(path, report, tol, require_stats):
     """Refresh one raster's sidecar and re-check it. Returns the new report."""
     reason = refusal(report)
+    failed = False
     if reason is None:
         try:
             side, reason = refresh_sidecar(path, report)
@@ -886,7 +911,11 @@ def apply_one(path, report, tol, require_stats):
                                             report["nodata_cells"])})
                 again["verdict"] = verdict_of(again["findings"])
             return again
+        # A refusal is a decision. A write that failed is the tool not doing
+        # what --apply asked, and the exit code must say so.
+        failed = True
     report["apply"] = "not refreshed: " + reason
+    report["apply_failed"] = failed
     return report
 
 
@@ -917,7 +946,8 @@ def exit_code(reports, missing, strict):
     verdicts = set(r["verdict"] for r in reports)
     if FAIL in verdicts or (strict and WARN in verdicts):
         return 1
-    if UNREADABLE in verdicts or missing or not reports:
+    if (UNREADABLE in verdicts or missing or not reports
+            or any(r.get("apply_failed") for r in reports)):
         return 2
     return 0
 
@@ -970,15 +1000,19 @@ def main(argv=None):
         print("error: --tol must be a finite number, zero or more.",
               file=sys.stderr)
         return 64
-    files, missing = collect(args.paths)
+    files, missing, unlisted = collect(args.paths)
     for path in missing:
         print("error: no such path: %s" % path, file=sys.stderr)
-    if not files and not missing:
+    if not (files or missing or unlisted):
         print("error: no .tif, .tiff or .asc file found.", file=sys.stderr)
     reports = [check_file(p, args.tol, args.require_stats) for p in files]
     if args.apply:
         reports = [apply_one(p, r, args.tol, args.require_stats)
                    for p, r in zip(files, reports)]
+    # A folder that cannot be listed hides its rasters: say so, never skip it.
+    reports += [{"path": str(exc.filename), "verdict": UNREADABLE,
+                 "reason": "could not list the folder: %s" % exc.strerror,
+                 "findings": []} for exc in unlisted]
     reports.sort(key=lambda r: _ORDER[r["verdict"]])
     counts = dict((v, sum(1 for r in reports if r["verdict"] == v))
                   for v in _ORDER)
@@ -1513,6 +1547,29 @@ def self_test():
           == ["STALE_STATS"],
           "an infinite cell never passes finite stored numbers (the scale "
           "stays finite)")
+    check(found_codes(judge(inf_scan, {K_MIN: 5.0}, False)[1])
+          == ["STALE_STATS"],
+          "an infinite data range gives the finite numbers no slack")
+    zero_mean = scan_cells([[-1.0, 1.0, -1.0, 1.0]], None, False)
+    check(judge(zero_mean, dict(stats_of(zero_mean), STATISTICS_MEAN=5e-7),
+                False)[1] == [],
+          "a mean off by a quarter millionth of the range passes, the range "
+          "being the scale")
+    check(summarize(acc_of([-1.0, 1.0]))["mean"] == 0.0,
+          "a mean of exactly 0 still gives a summary")
+    check(valid_percent_text(1, 10) == "10" and valid_percent_text(1, 1)
+          == "100", "one valid cell is not 0 percent")
+    resid = [summarize(acc_merge(acc_of([0.7] * k), acc_of([0.7] * (k + 3))))
+             ["std"] for k in range(1, 40)]
+    check(resid == [0.0] * 39,
+          "a constant raster has a deviation of exactly 0 however the blocks "
+          "merge  <-- pinned defect")
+    raises(lambda: acc_of([float("inf"), float("-inf"), 2.0]),
+           "cells holding both infinities are unreadable, not a crash"
+           "  <-- pinned defect")
+    raises(lambda: acc_of([1e200, 1.0, 2.0]),
+           "cells too large to square are unreadable, not a crash"
+           "  <-- pinned defect")
 
     # ---- the LZW codec
     raw_stream = bytes(bytearray(range(256)) * 3)
@@ -1667,6 +1724,90 @@ def self_test():
         make_sidecar(at("nan2.asc"), {K_MEAN: "nan"})
         check(codes(check_file(at("nan2.asc"))) == ["STALE_STATS"],
               "a stored NaN never matches")
+
+        # ---- a NoData value kept in the sidecar
+        def nd_side(name, text, rows=dem, band="1", **kw):
+            make_tiff(at(name), rows, bits=16, fmt=2, **kw)
+            put(name + ".aux.xml",
+                '<PAMDataset><PAMRasterBand band="%s"><NoDataValue>%s'
+                "</NoDataValue><Metadata>%s</Metadata></PAMRasterBand>"
+                "</PAMDataset>" % (band, text, "".join(
+                    '<MDI key="%s">%s</MDI>' % kv for kv in sorted(
+                        items.items()))))
+            return check_file(at(name))
+        rep = nd_side("sidend.tif", "-9999")
+        check(rep["verdict"] == OK and rep["nodata"] == -9999.0
+              and rep["nodata_cells"] == 2,
+              "a NoData value held only in the sidecar masks its cells, as "
+              "GDAL reads it  <-- pinned defect")
+        rep = nd_side("sidend2.tif", "-9999", nodata="-1")
+        check(rep["nodata"] == -9999.0 and rep["verdict"] == OK,
+              "a sidecar NoData value replaces the one in the TIFF tag")
+        rep = nd_side("sidend3.tif", "-9999", band="2")
+        check(rep["nodata"] is None,
+              "a NoData value stored for band 2 is not band 1's")
+        check("sidecar NoDataValue" in nd_side("sidend4.tif", "abc")["reason"],
+              "a sidecar NoData value that is not a number is unreadable")
+        check("sidecar NoDataValue" in nd_side("sidend5.tif", "")["reason"],
+              "an empty sidecar NoData value is unreadable")
+        make_tiff(at("sidend6.tif"), [[1.5, 2.5, -3.4028234663852886e+38]],
+                  bits=32, fmt=3)
+        put("sidend6.tif.aux.xml", '<PAMDataset><PAMRasterBand band="1">'
+            "<NoDataValue>-3.40282346638529e+38</NoDataValue>"
+            "</PAMRasterBand></PAMDataset>")
+        check(check_file(at("sidend6.tif"))["nodata_cells"] == 1,
+              "a float32 sidecar NoData value compares in float32")
+        make_tiff(at("sidend7.tif"), dem, bits=16, fmt=2, nodata="-9999")
+        put("sidend7.tif.aux.xml", '<PAMDataset><PAMRasterBand band="1">'
+            "</PAMRasterBand></PAMDataset>")
+        check(check_file(at("sidend7.tif"))["nodata"] == -9999.0,
+              "a sidecar with no NoData value keeps the tag's")
+        make_asc(at("sidend8.asc"), dem, nodata=None)
+        put("sidend8.asc.aux.xml", '<PAMDataset><PAMRasterBand band="1">'
+            "<NoDataValue>-9999</NoDataValue></PAMRasterBand></PAMDataset>")
+        check(check_file(at("sidend8.asc"))["nodata"] is None,
+              "an ASCII grid ignores a sidecar NoData value, as GDAL does")
+
+        # ---- rasters one cell wide or high
+        for name, rows in (("one", [[5]]), ("row", [[1, 2, 3]]),
+                           ("col", [[1], [2], [3]])):
+            flat1 = [v for r in rows for v in r]
+            make_tiff(at(name + ".tif"), rows, bits=16, fmt=2)
+            make_sidecar(at(name + ".tif"), good_items(flat1))
+            make_asc(at(name + ".asc"), rows)
+            make_sidecar(at(name + ".asc"), good_items(flat1))
+            check(check_file(at(name + ".tif"))["verdict"] == OK
+                  and check_file(at(name + ".asc"))["verdict"] == OK,
+                  "a %s raster reads and passes, TIFF and grid" % name)
+        make_tiff(at("tile1.tif"), [[1, 2], [3, 4]], bits=16, fmt=2,
+                  tile=(1, 1))
+        check(check_file(at("tile1.tif"))["valid_cells"] == 4,
+              "a tile one cell wide and high is read")
+
+        # ---- healthy rasters that once failed or crashed the scan
+        for width in (7, 8, 33):
+            make_tiff(at("const.tif"), [[0.7] * width for _r in range(3)],
+                      bits=64, fmt=3, tile=(4, 4),
+                      items={K_MIN: "0.7", K_MAX: "0.7", K_MEAN: "0.7",
+                             K_STD: "0", K_VALID: "100"})
+            check(check_file(at("const.tif"))["verdict"] == OK,
+                  "a constant float raster %d wide passes with a stored "
+                  "deviation of 0  <-- pinned defect" % width)
+        crash_dir = at("crash")
+        os.makedirs(crash_dir)
+        make_tiff(os.path.join(crash_dir, "a_inf.tif"),
+                  [[float("inf"), float("-inf")], [2.0, 3.0]], bits=32, fmt=3)
+        make_tiff(os.path.join(crash_dir, "b_big.tif"), [[1e200, 1.0]],
+                  bits=64, fmt=3)
+        make_asc(os.path.join(crash_dir, "c_inf.asc"), [["inf", "-inf"]])
+        make_asc(os.path.join(crash_dir, "z_ok.asc"), dem)
+        make_sidecar(os.path.join(crash_dir, "z_ok.asc"), items)
+        code, out, err = run([crash_dir])
+        check(code == 2 and out.count("UNREADABLE") == 3
+              and "OK         " in out and "scanned=4" in out
+              and "the cells hold both +inf and -inf" in out,
+              "cells that cannot give statistics are reported UNREADABLE, the "
+              "rest of the folder is still scanned  <-- pinned defect")
 
         # ---- the TIFF reader, every sample type, both byte orders
         grid = [[(x * 7 + y * 3) % 50 - 10 for x in range(37)]
@@ -1974,20 +2115,57 @@ def self_test():
 
         # ---- walking a tree
         tree = at("tree")
+        empty_walk = at("emptywalk")
+        os.makedirs(empty_walk)
         os.makedirs(os.path.join(tree, "b"))
         os.makedirs(os.path.join(tree, "a"))
         for rel in ("b/two.TIF", "a/one.asc", "a/skip.txt", "top.tiff",
                     "a/one.asc.aux.xml"):
             with open(os.path.join(tree, rel), "wb") as handle:
                 handle.write(b"x")
-        files, missing = collect([tree, at("nope")])
+        files, missing, unlisted = collect([tree, at("nope")])
         names = [os.path.relpath(f, tree).replace(os.sep, "/") for f in files]
         check(names == ["top.tiff", "a/one.asc", "b/two.TIF"],
               "a tree yields rasters only, sorted within each folder")
         check(missing == [at("nope")], "a missing path is reported")
-        files, missing = collect([at("ok.asc")])
-        check(files == [at("ok.asc")] and missing == [],
+        check(unlisted == [], "a folder that lists is not reported")
+        files, missing, unlisted = collect([at("ok.asc")])
+        check(files == [at("ok.asc")] and missing == [] and unlisted == [],
               "a file argument is taken as it is")
+        real_walk = os.walk
+
+        def walk_denied(top, onerror=None):
+            onerror(OSError(13, "Permission denied", os.path.join(top, "x")))
+            return real_walk(top, onerror=onerror)
+        os.walk = walk_denied
+        try:
+            files, missing, unlisted = collect([tree])
+            code, out, err = run([tree])
+            code_j, out_j, err_j = run([tree, "--json"])
+        finally:
+            os.walk = real_walk
+        check(len(unlisted) == 1 and len(files) == 3,
+              "a folder that cannot be listed is collected, the rest still is")
+        check(code == 2 and "UNREADABLE" in out
+              and "could not list the folder: Permission denied" in out
+              and os.path.join(tree, "x") in out and "no .tif" not in err,
+              "an unlistable folder is reported UNREADABLE and exits 2, never "
+              "skipped  <-- pinned defect")
+        check(any(f["verdict"] == UNREADABLE
+                  for f in json.loads(out_j)["files"]),
+              "and appears in --json")
+
+        def walk_none(top, onerror=None):
+            onerror(OSError(13, "Permission denied", top))
+            return iter([])
+        os.walk = walk_none
+        try:
+            code, out, err = run([empty_walk])
+        finally:
+            os.walk = real_walk
+        check(code == 2 and err == "" and "UNREADABLE" in out
+              and "scanned=1" in out,
+              "a folder that cannot be listed at all is not 'no file found'")
 
         # ---- the command line
         good_dir = at("cli_ok")
@@ -1995,8 +2173,8 @@ def self_test():
         make_asc(os.path.join(good_dir, "g.asc"), dem)
         make_sidecar(os.path.join(good_dir, "g.asc"), items)
         code, out, err = run([good_dir])
-        check(code == 0 and "NODATALIE fail=0 warn=0 ok=1" in out,
-              "a clean tree exits 0")
+        check(code == 0 and "NODATALIE fail=0 warn=0 ok=1" in out
+              and err == "", "a clean tree exits 0 and prints no error")
         check(out.splitlines()[0].startswith("OK         "),
               "the report line starts with the verdict")
         bad_dir = at("cli_bad")
@@ -2037,8 +2215,12 @@ def self_test():
         check(run([os.path.join(bad_dir, "d_bad.asc")])[0] == 2,
               "an unreadable raster alone exits 2")
         code, out, err = run([good_dir, at("nope")])
-        check(code == 2 and "no such path" in err,
+        check(code == 2 and "no such path" in err and "no .tif" not in err,
               "a path that does not exist exits 2, never 0")
+        code, out, err = run([at("nope")])
+        check(code == 2 and "no such path" in err and "no .tif" not in err,
+              "a lone missing path says it is missing, not that no file "
+              "exists")
         check(run([bad_dir, at("nope")])[0] == 1,
               "a failure outranks a missing path")
         empty_dir = at("cli_empty")
@@ -2060,6 +2242,31 @@ def self_test():
               "a tolerance that is not a number is a usage error")
         check(run([good_dir, "--tol", "0.5"])[0] == 0,
               "a loose tolerance is accepted")
+        exact_dir = at("cli_exact")
+        os.makedirs(exact_dir)
+        make_asc(os.path.join(exact_dir, "e.asc"), [[0, 2], [0, 2]])
+        make_sidecar(os.path.join(exact_dir, "e.asc"),
+                     {K_MIN: "0", K_MAX: "2", K_MEAN: "1", K_STD: "1"})
+        check(run([exact_dir, "--tol", "0"])[0] == 0,
+              "a tolerance of 0 is accepted and exact numbers pass it")
+        make_sidecar(os.path.join(exact_dir, "e.asc"),
+                     {K_MIN: "0", K_MAX: "2", K_MEAN: "1.0000001", K_STD: "1"})
+        check(run([exact_dir, "--tol", "0"])[0] == 1
+              and run([exact_dir])[0] == 0,
+              "and a tolerance of 0 refuses a gap that the default allows")
+        count_dir = at("cli_count")
+        os.makedirs(count_dir)
+        for name in ("a.asc", "b.asc", "c.asc", "d.asc"):
+            make_asc(os.path.join(count_dir, name), dem)
+        make_sidecar(os.path.join(count_dir, "a.asc"),
+                     dict(items, STATISTICS_MEAN="1"))
+        make_sidecar(os.path.join(count_dir, "b.asc"),
+                     dict(items, STATISTICS_MEAN="2"))
+        make_sidecar(os.path.join(count_dir, "d.asc"), items)
+        code, out, err = run([count_dir])
+        check(out.splitlines()[-1]
+              == "NODATALIE fail=2 warn=1 ok=1 unreadable=0 scanned=4",
+              "the summary puts each count against its own name")
         code, out, err = run([good_dir, "--ap"])
         check(code == 64 and "unrecognized" in err,
               "a unique prefix --ap of --apply is REFUSED by the parser"
@@ -2199,6 +2406,38 @@ def self_test():
               "a failed write leaves the old sidecar whole")
         check([n for n in os.listdir(wdir) if n.endswith(".tmp")] == [],
               "and removes its temporary file")
+        check(code == 1, "a stale raster whose write failed still exits 1")
+
+        # ---- a write that failed is a tool failure, exit 2
+        fdir = at("failed")
+        os.makedirs(fdir)
+        make_tiff(os.path.join(fdir, "n.tif"), wrows, bits=16, fmt=2,
+                  nodata="-9999")
+        nside = make_sidecar(os.path.join(fdir, "n.tif"), {})
+        with open(nside + BAK_SUFFIX, "w") as handle:
+            handle.write("old")
+        code, out, err = run([fdir, "--apply"])
+        check(code == 2 and "a backup already exists" in out,
+              "--apply on a raster with no statistics exits 2 when a backup "
+              "blocks the write  <-- pinned defect")
+        check(json.loads(run([fdir, "--apply", "--json"])[1])["files"][0]
+              ["apply_failed"] is True, "--json says the write failed")
+        os.remove(nside)
+        os.remove(nside + BAK_SUFFIX)
+        os.replace = refuse
+        try:
+            code, out, err = run([fdir, "--apply"])
+        finally:
+            os.replace = real_replace
+        check(code == 2 and "could not write the sidecar" in out,
+              "--apply on a raster with no statistics exits 2 when the write "
+              "fails  <-- pinned defect")
+        code, out, err = run([wat("inside.tif"), "--apply", "--json"])
+        check(code == 0 and json.loads(out)["files"][0]["apply_failed"]
+              is False, "a refusal is a decision, not a failed write: exit 0")
+        code, out, err = run([fdir, "--apply"])
+        check(code == 0 and "apply: refreshed" in out,
+              "and with the obstacle gone the same --apply exits 0")
 
         # ---- exit codes after a refresh that took a NoData value as right
         for name, extra, want_code in (("late_a", [], 0),
