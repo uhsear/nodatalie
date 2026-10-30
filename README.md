@@ -35,6 +35,9 @@ OK         demo/dem_ok.tif  cells=12 valid=10 nodata=-9999 nodata_cells=2
 NODATALIE fail=2 warn=1 ok=1 unreadable=0 scanned=4
 ```
 
+The quoted output comes from Ubuntu. Path separators in it follow the platform, so on Windows the
+same run prints `demo\dem_late.tif`.
+
 ## What already exists
 
 GDAL is the right tool for most raster questions, and this tool does not replace it. It reads
@@ -53,12 +56,13 @@ Esri's Calculate Statistics tool recomputes, and its "Skip Existing" setting dec
 keep stored statistics or regenerate them. Its "Ignore Values" setting excludes values such as
 NoData from the calculation.
 
-What none of these does is compare. GDAL and Esri produce or print statistics. They do not read
-the stored ones, recompute, diff, and exit non-zero. That comparison, run on a folder, is the one
-thing this tool adds. A search of GitHub repositories for `nodatalie` returned no result on
-2026-10-22, and searches for `raster statistics nodata validate`, `stale raster statistics
-aux.xml` and `gdal check statistics nodata` returned no result either. That says nothing about
-tools that are named differently.
+GDAL and Esri produce or print statistics. The comparison they do not print is stored against
+recomputed, with a non-zero exit code, over a folder. QGIS and `rasterio` come close by the same
+route: both can compute the statistics of a raster, and you can diff the result with the stored
+numbers by hand. This tool does that diff for you. On 2026-10-29, `gh search repos nodatalie`
+returned only this repository. Searches for `raster statistics nodata validate`, `stale raster
+statistics aux.xml` and `gdal check statistics nodata` returned no repository. That says nothing
+about tools that are named differently.
 
 ## Requirements
 
@@ -113,7 +117,7 @@ python nodatalie.py D:\rasters --apply
 | Flag | Default | What it does |
 |---|---|---|
 | `PATH ...` | none | `.tif`, `.tiff` or `.asc` files, or folders searched recursively. Required. |
-| `--tol` | `1e-6` | Relative tolerance for each stored number. |
+| `--tol` | `1e-6` | Tolerance for each stored number, relative to the data range or the value, whichever is larger. Must be above zero: `--tol 0` reports `STALE_STATS` on numbers that print the same, because float noise exceeds zero. |
 | `--require-stats` | off | A raster with no stored statistics fails instead of warning. |
 | `--strict` | off | A warning exits 1 as well. |
 | `--json` | off | One JSON document, worst raster first. |
@@ -121,9 +125,10 @@ python nodatalie.py D:\rasters --apply
 | `--self-test` | off | Run the offline assertions and exit. |
 
 Exit codes: 0 clean, 1 a finding (a warning too under `--strict`), 2 a raster could not be read,
-a path does not exist or the folder holds no raster, 64 usage error. A finding outranks an
-unreadable file. The parser sets `allow_abbrev=False`, so `--ap` is refused with exit 64 and a
-short prefix can never turn on a write.
+a path does not exist, a folder could not be listed or holds no raster, or an `--apply` write
+failed, 64 usage error. A failed write outranks a finding, and a finding outranks an unreadable
+file. The parser sets `allow_abbrev=False`, so `--ap` is refused with exit 64 and a short prefix
+can never turn on a write.
 
 ### Findings
 
@@ -135,6 +140,7 @@ short prefix can never turn on a write.
 | `NODATA_INSIDE_RANGE` | WARN | The NoData value lies strictly between the smallest and largest real cell, and cells hold it. |
 | `NODATA_UNREPRESENTABLE` | WARN | An integer raster declares a NoData value no cell can equal, such as -9999 on 8-bit data. |
 | `ALL_NODATA` | FAIL | Every cell is NoData or NaN, so no statistic exists. |
+| `NODATA_ASSUMED` | WARN | Added by `--apply` after it refreshed a `STATS_COUNT_NODATA` raster. The tool took the declared NoData value as right. |
 
 A stale finding is only a WARN when the stored numbers carry `STATISTICS_APPROXIMATE`, because
 approximate statistics are allowed to differ.
@@ -149,10 +155,17 @@ since there is nothing to write.
 
 If a sidecar exists, `--apply` copies it to `name.tif.aux.xml.nodatalie.bak`, edits it in place
 and keeps every other element (histograms, other metadata domains, other keys). It never
-overwrites an existing backup: it stops and says so. The new file is written to a temporary name
+overwrites an existing backup: it stops and says so. If the write fails, it removes the backup it
+made, so the next `--apply` is not blocked by it. The new file is written to a temporary name
 and renamed, so a crash leaves one whole file. It then checks the raster again and prints the new
 verdict. Format of the numbers: GDAL's own, 14 significant digits, and a valid percent rounded as
 GDAL rounds it.
+
+A `STATS_COUNT_NODATA` raster is refreshed, not refused. The tool cannot tell whether the NoData
+value or the old statistics were right, so it takes the NoData value as right, adds the
+`NODATA_ASSUMED` warning once, and exits 0 unless `--strict` is also given. The next plain run
+reports `OK`, because the new sidecar matches the declared value. Use `--strict` in automation and
+keep the `.nodatalie.bak` copy until a person has confirmed the NoData value.
 
 ```
 $ python nodatalie.py demo --apply
@@ -160,13 +173,14 @@ WARN       demo/bathy.tif  cells=8 valid=5 nodata=0 nodata_cells=3
     NO_STATS               no stored statistics: a legend or stretch has nothing to read
     NODATA_INSIDE_RANGE    NoData value 0 lies inside the data range -5..40 and masks 3 cells (37.50 percent): confirm they are not real values
     apply: not refreshed: the NoData value needs a decision first; refreshing would hide it
-OK         demo/dem_late.tif  cells=12 valid=10 nodata=-9999 nodata_cells=2
+WARN       demo/dem_late.tif  cells=12 valid=10 nodata=-9999 nodata_cells=2
+    NODATA_ASSUMED         --apply took the declared NoData value -9999 as right and left its 2 cells out of the new statistics: if they are real data, clear the NoData value and recompute (the old sidecar, if there was one, is in the .nodatalie.bak copy)
     apply: refreshed
 OK         demo/dem_ok.tif  cells=12 valid=10 nodata=-9999 nodata_cells=2
     apply: not refreshed: nothing to refresh
 OK         demo/slope.asc  cells=12 valid=10 nodata=-9999 nodata_cells=2
     apply: refreshed
-NODATALIE fail=0 warn=1 ok=3 unreadable=0 scanned=4
+NODATALIE fail=0 warn=2 ok=2 unreadable=0 scanned=4
 ```
 
 ## How it decides
@@ -183,8 +197,11 @@ NODATALIE fail=0 warn=1 ok=3 unreadable=0 scanned=4
 5. Read the stored numbers: the in-file `GDAL_METADATA` tag for a TIFF, then the `.aux.xml`
    sidecar on top of it key by key. GDAL does the same, and the self-test pins it.
 6. Compare the minimum, maximum, mean, standard deviation and valid percent that are stored. A
-   missing key is not compared. Numbers match inside `--tol`, relative, with a floor of 1.0 on
-   the scale so a mean near zero does not fail on noise.
+   missing key is not compared. Two numbers match when they differ by at most `--tol` times the
+   larger of the data range (maximum minus minimum), the stored number and the recomputed number.
+   The range keeps a mean near zero from failing on noise, and it keeps a raster of tiny values
+   from being compared against a fixed 1.0. A raster with a large range is checked loosely: a mean
+   off by 0.0005 on a range of 2000 is inside the default tolerance.
 7. On a gap, compare the stored numbers with the statistics of all cells, NoData counted. A match
    is `STATS_COUNT_NODATA`. No match is `STALE_STATS`.
 
@@ -233,14 +250,14 @@ PASS  --apply never touches the raster itself  <-- pinned defect
 PASS  a NoData value inside the range is not papered over  <-- pinned defect
 ...
 --------------------------------------------------------------------
-248 assertions, 0 failed
+341 assertions, 0 failed
 ```
 
-That run is 248 assertions on Windows under `C:\Python313\python.exe` 3.13.2. The same count
-passes on Windows under 3.9.25, 3.10.20 and 3.12, and on Ubuntu under `python3` 3.12.3. The lines
-cut with `...` are more of the same block above them.
+That run is 341 assertions on Windows under `C:\Python313\python.exe` 3.13.2. The same count
+passes on Windows under 3.9.25 and 3.12, and on Ubuntu under `python3` 3.12.3. There is no
+difference between the hosts. The lines cut with `...` are more of the same block above them.
 
-Branch coverage of `nodatalie.py` is 100 percent: 1,326 statements and 354 branches, measured
+Branch coverage of `nodatalie.py` is 100 percent: 1,602 statements and 400 branches, measured
 with `coverage run --branch nodatalie.py --self-test`. One line carries `# pragma: no branch`,
 the `if __name__ == "__main__":` guard. Coverage runs the file as a script, so the guard's false
 arc can never be taken. `pyflakes` is clean and `python -W error` compiles the file clean.
@@ -258,7 +275,11 @@ synthetic data:
 | A sidecar overrides the in-file tag, key by key | GDAL file with all four statistics in the tag and only `STATISTICS_MAXIMUM` in the sidecar | `tags()` showed the sidecar maximum and the three tag values |
 | An ASCII grid reads the same as GDAL | 31 x 17 grid written by the fixture helper, read by both | the means differ by 6e-10 relative, the minimum is equal |
 | Hostile sidecar XML is refused | A sidecar with a nested entity expansion | `UNREADABLE`, in 0.1 s, on Windows (expat 2.6.4) and Ubuntu (expat 2.6.1) |
-| Speed | 2000 x 2000 int16, one run on the Windows workstation | 4.2 million cells a second uncompressed, 3.5 with deflate tiles, 0.7 with LZW and predictor, 2.4 for ASCII |
+| Speed | 2000 x 2000 int16, one run on the Windows workstation | 4.2 million cells a second uncompressed, 3.5 with deflate tiles, 0.7 with LZW and predictor, 2.4 for ASCII. A later run on another day measured 3.2 million uncompressed, so read the figures as an order of magnitude. |
+
+The scripts for the GDAL cross-checks, the speed runs and the reintroduced-defect runs are not
+shipped. The repository holds four files, so you cannot rerun those rows. The self-test is the
+part you can rerun.
 
 Every pinned defect marked in the self-test was reintroduced one at a time to confirm it fails
 the run: the sample deviation, the valid-percent clamp, the token carry across read blocks, the
@@ -271,7 +292,8 @@ guard, the two exit-code rules and the signed predictor. All 15 made the run fai
 - Read most real-world rasters. It reads classic TIFF and Esri ASCII grid only. BigTIFF, JPEG,
   ZSTD and PackBits compression, the floating-point predictor, more than one band, Esri file
   geodatabase rasters, IMG, Esri GRID and cloud formats come back `UNREADABLE` with a reason.
-  `gdalinfo -mm` is the answer for those.
+  `gdalinfo -mm` is the answer for those. One such file makes the whole run exit 2, even when
+  every readable raster beside it is `OK` and there is no finding.
 - Match GDAL on speed. It is pure Python. A raster of 100 million cells takes about 25 seconds
   uncompressed and about 2.5 minutes with LZW and predictor 2.
 - Know what the right NoData value is. `STATS_COUNT_NODATA` says the NoData value and the stored
@@ -279,8 +301,9 @@ guard, the two exit-code rules and the signed predictor. All 15 made the run fai
 - Read statistics stored anywhere but `GDAL_METADATA` and the `.aux.xml` sidecar. Statistics held
   by an Esri geodatabase or an `.ovr` file are invisible to it. It was not run against ArcGIS Pro
   output, because no Esri software was available.
-- Read a NoData value from the sidecar. GDAL can keep one there for formats that cannot store it.
-  This tool takes the value from the TIFF tag or the ASCII header only.
+- Read a NoData value from the sidecar of an ASCII grid. For a GeoTIFF it does: a `NoDataValue`
+  in the sidecar replaces the tag, or stands in for a missing tag, as GDAL does. An ASCII grid
+  takes the value from its header only.
 - Apply Esri's default. Esri documents `-9999` as the default `NODATA_value` of an ASCII grid
   when the header omits it. This tool reads a header with no `NODATA_value` as declaring none.
 - Match GDAL to the last digit on ASCII grids. GDAL autodetects `float32` for many grids, and
@@ -289,8 +312,58 @@ guard, the two exit-code rules and the signed predictor. All 15 made the run fai
 - Defend against every hostile file. The sidecar is parsed with the standard library's
   `ElementTree`, which does not fetch external entities and stops runaway entity expansion on the
   expat versions listed above. An older expat is untested.
-- Print strict JSON for every value. A stored value of `nan` in a sidecar comes out of `--json` as
-  a bare `NaN`, which strict JSON parsers refuse. Python's `json` module reads it.
+- Print a non-finite number as a number in `--json`. A NoData value of NaN, or a stored `nan` or
+  `inf`, comes out as the string `"nan"`, `"inf"` or `"-inf"`, so strict JSON parsers accept the
+  report. A program that reads the numbers must convert those strings.
+- Catch a stale statistic that is closer than the tolerance. The tolerance is 1e-6 times the
+  larger of the data range and the value size, so a raster with a large range or offset (epoch
+  seconds, for example) is checked loosely. Editing one interior cell by 0.5 in a 3,600 cell float
+  raster whose values span 0 to 1,000 stays `OK`: the mean moves by 1.4e-4 and the tolerance is
+  1e-3.
+- Read the value of `STATISTICS_APPROXIMATE`. It tests the key by presence only. A stale result
+  then drops from `FAIL` to `WARN` and exits 0, even when the stored minimum is above the real
+  minimum by the whole NoData sentinel, which is the "NoData cleared" case in the story above. Run
+  files with approximate-flagged statistics under `--strict`. Statistics that ArcGIS computed with
+  a skip factor above 1 are samples, so they can be reported `STALE_STATS` although they are
+  current, because only the flag is read.
+- Flag NoData at or beyond the edge of the real data range. `NODATA_INSIDE_RANGE` fires strictly
+  inside the range, so NoData 0 on a raster whose real values are all positive masks its zero
+  cells and still reports `OK`.
+- Report a Windows file name that the console cannot encode. With stdout redirected to a file or a
+  pipe (cp1252) and a path with a character outside cp1252, the text report ends in a
+  `UnicodeEncodeError` traceback and the exit code is 1, which looks like a finding. `--json`
+  escapes the name and is not affected.
+- Check a path twice. Give each path once: a duplicate, or a folder plus a file inside it, is
+  scanned twice. With `--apply`, the second pass uses the stale first report, so it stops with "a
+  backup already exists" and exits 2, or it copies the tool's own new sidecar into the `.bak` slot.
+- Keep a symlinked sidecar. `--apply` replaces a symlinked `.aux.xml` with a regular file.
+- Read every ASCII grid. A byte order mark or UTF-16 text makes it `UNREADABLE` ("header has no
+  ncols"), and a folder scan reports any `.asc` file that is not a grid, such as a signature file,
+  the same way, so the run exits 2. Cell text is parsed with Python's `float`, which accepts
+  `1_0` (read as 10), `nan` and `inf`. A header with no `NODATA_value` is read as declaring none,
+  so a grid that Esri software wrote that way, with statistics that exclude -9999, can report
+  `STALE_STATS`.
+- Ignore a damaged sidecar. A zero-byte or malformed `.aux.xml` makes its raster `UNREADABLE`
+  instead of being skipped. Stored statistic keys are matched case-sensitively, and a misspelled
+  key is skipped without a warning. A duplicate `MDI` key in a sidecar, or a duplicate header key
+  in an ASCII grid, resolves to the last one.
+- Limit memory on a hostile file. LZW and deflate blocks are decompressed with no output size cap.
+- Handle a mixed run in one exit code. A run with a finding and an unreadable file exits 1. Read
+  the `UNREADABLE` lines and the summary count to see what was not checked.
+- Handle an infinite cell. One `+inf` cell gives a NaN standard deviation, so a stored NaN is
+  compared as `STALE_STATS` even when it matches. Mixed `+inf` and `-inf` cells are `UNREADABLE`.
+- Read sparse blocks. GeoTIFF blocks with offset 0 and count 0, as GDAL writes with `SPARSE_OK`,
+  are reported `UNREADABLE` ("a block decodes to 0 bytes"), and the run exits 2.
+- Pin every mutant. I ran 594 comparison, boolean and branch mutants and 557 statement-deletion
+  and constant mutants over the code before the fixtures, and 70 survived. Most are equivalent or
+  cosmetic: dead `valid == 0`, `nd_hits == 0` and `if found` shortcuts, usage printing, JSON
+  indent, `ET.indent` and the `VALID_PCT_TOL` boundary. The two that mattered, the float32
+  rounding of a sidecar NoData value and the signed-predictor boundary, now have assertions. These
+  also survive, so no assertion pins them: the truncated-IFD length check (`12 * count`), the
+  defaults for missing `SampleFormat`, `BitsPerSample`, `Compression` and `SamplesPerPixel` tags,
+  the deflate code 32946, and `dirnames.sort()` (the output order within one verdict). The
+  `allow_nan=False` argument of `json.dumps` is a second guard behind `_strict_json`, so removing
+  it changes no output.
 
 ## Sources
 

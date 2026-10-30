@@ -845,41 +845,48 @@ def refresh_sidecar(path, report):
     one replaces it by rename, so a crash leaves one whole file.
     """
     side = sidecar_path(path)
-    if os.path.exists(side):
-        if os.path.exists(side + BAK_SUFFIX):
-            return None, "a backup already exists: %s" % (side + BAK_SUFFIX)
-        shutil.copy2(side, side + BAK_SUFFIX)
-        tree = ET.parse(side)
-    else:
-        tree = ET.ElementTree(ET.Element("PAMDataset"))
-    root = tree.getroot()
-    band = _band_one(root)
-    if band is None:
-        band = ET.SubElement(root, "PAMRasterBand", {"band": "1"})
-    meta = None
-    for candidate in band.findall("Metadata"):
-        if candidate.get("domain") is None:
-            meta = candidate
-    if meta is None:
-        meta = ET.SubElement(band, "Metadata")
-    rec = report["recomputed"]
-    for key, name in STAT_KEYS:
-        _set_mdi(meta, key, "%.14g" % rec[name])
-    _set_mdi(meta, K_VALID,
-             valid_percent_text(report["valid_cells"], report["cells"]))
-    for item in meta.findall("MDI"):
-        if item.get("key") == K_APPROX:
-            meta.remove(item)
-    ET.indent(tree, space="  ")
-    handle, temp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(side)),
-                                    suffix=".tmp")
+    made = []
     try:
+        if os.path.exists(side):
+            bak = side + BAK_SUFFIX
+            if os.path.exists(bak):
+                return None, "a backup already exists: %s" % bak
+            made.append(bak)
+            shutil.copy2(side, bak)
+            tree = ET.parse(side)
+        else:
+            tree = ET.ElementTree(ET.Element("PAMDataset"))
+        root = tree.getroot()
+        band = _band_one(root)
+        if band is None:
+            band = ET.SubElement(root, "PAMRasterBand", {"band": "1"})
+        meta = None
+        for candidate in band.findall("Metadata"):
+            if candidate.get("domain") is None:
+                meta = candidate
+        if meta is None:
+            meta = ET.SubElement(band, "Metadata")
+        rec = report["recomputed"]
+        for key, name in STAT_KEYS:
+            _set_mdi(meta, key, "%.14g" % rec[name])
+        _set_mdi(meta, K_VALID,
+                 valid_percent_text(report["valid_cells"], report["cells"]))
+        for item in meta.findall("MDI"):
+            if item.get("key") == K_APPROX:
+                meta.remove(item)
+        ET.indent(tree, space="  ")
+        handle, temp = tempfile.mkstemp(
+            dir=os.path.dirname(os.path.abspath(side)), suffix=".tmp")
+        made.append(temp)
         with os.fdopen(handle, "wb") as out:
             tree.write(out, encoding="utf-8")
         os.replace(temp, side)
     except OSError:
-        with contextlib.suppress(OSError):
-            os.remove(temp)
+        # A failed write must not leave its own backup behind: the next
+        # --apply would refuse because "a backup already exists".
+        for leftover in made:
+            with contextlib.suppress(OSError):
+                os.remove(leftover)
         raise
     return side, "refreshed"
 
@@ -943,13 +950,27 @@ def describe(report):
 
 
 def exit_code(reports, missing, strict):
+    # A failed --apply write is the tool not doing what it was asked, so it
+    # outranks a finding: a CI step must be able to tell the two apart.
+    if any(r.get("apply_failed") for r in reports):
+        return 2
     verdicts = set(r["verdict"] for r in reports)
     if FAIL in verdicts or (strict and WARN in verdicts):
         return 1
-    if (UNREADABLE in verdicts or missing or not reports
-            or any(r.get("apply_failed") for r in reports)):
+    if UNREADABLE in verdicts or missing or not reports:
         return 2
     return 0
+
+
+def _strict_json(value):
+    """Copy of value with each non-finite float as a string: strict JSON."""
+    if isinstance(value, dict):
+        return dict((k, _strict_json(v)) for k, v in value.items())
+    if isinstance(value, list):
+        return [_strict_json(v) for v in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return str(value)
+    return value
 
 
 class _Parser(argparse.ArgumentParser):
@@ -1020,8 +1041,8 @@ def main(argv=None):
                % (counts[FAIL], counts[WARN], counts[OK], counts[UNREADABLE],
                   len(reports)))
     if args.json:
-        print(json.dumps({"summary": summary, "files": reports}, indent=2,
-                         sort_keys=True))
+        print(json.dumps(_strict_json({"summary": summary, "files": reports}),
+                         indent=2, sort_keys=True, allow_nan=False))
     else:
         for report in reports:
             for line in describe(report):
@@ -1767,6 +1788,23 @@ def self_test():
             "<NoDataValue>-9999</NoDataValue></PAMRasterBand></PAMDataset>")
         check(check_file(at("sidend8.asc"))["nodata"] is None,
               "an ASCII grid ignores a sidecar NoData value, as GDAL does")
+        rows64 = [[1.5, -9999.1, 2.5, -9999.1, 4.0]]
+        make_tiff(at("f64side.tif"), rows64, bits=64, fmt=3)
+        put("f64side.tif.aux.xml", '<PAMDataset><PAMRasterBand band="1">'
+            "<NoDataValue>-9999.1</NoDataValue></PAMRasterBand></PAMDataset>")
+        rep64 = check_file(at("f64side.tif"))
+        check(rep64["nodata"] == -9999.1 and rep64["nodata_cells"] == 2,
+              "a float64 sidecar NoData value is not rounded to float32"
+              "  <-- pinned defect")
+        make_tiff(at("f64tag.tif"), rows64, bits=64, fmt=3, nodata="-9999.1")
+        check(check_file(at("f64tag.tif"))["nodata_cells"] == 2,
+              "a float64 tag NoData value is not rounded to float32"
+              "  <-- pinned defect")
+        make_tiff(at("i32tag.tif"), [[1, 16777217, 5]], bits=32, fmt=2,
+                  nodata="16777217")
+        check(check_file(at("i32tag.tif"))["nodata_cells"] == 1,
+              "a 32 bit integer NoData value is not rounded to float32"
+              "  <-- pinned defect")
 
         # ---- rasters one cell wide or high
         for name, rows in (("one", [[5]]), ("row", [[1, 2, 3]]),
@@ -1850,6 +1888,12 @@ def self_test():
                   pred=2)
         check(check_file(at("sneg.tif"))["recomputed"]["min"] == -3.0,
               "a signed 8 bit predictor wraps to the right sign")
+        make_tiff(at("pbound.tif"), [[-32768, 0, 32767, -32768]], bits=16,
+                  fmt=2, comp=8, pred=2)
+        edge = check_file(at("pbound.tif"))["recomputed"]
+        check(edge["min"] == -32768.0 and edge["max"] == 32767.0,
+              "predictor 2 keeps the smallest 16 bit value negative"
+              "  <-- pinned defect")
         make_tiff(at("blocks.tif"), grid, bits=16, fmt=2, rps=29)
         with block_bytes(10):
             blocks = check_file(at("blocks.tif"))
@@ -2388,7 +2432,7 @@ def self_test():
                          '</PAMRasterBand></PAMDataset>')
         stale_again = digest(side)
         code, out, err = run([wat("stale.tif"), "--apply"])
-        check("a backup already exists" in out and code == 1
+        check("a backup already exists" in out and code == 2
               and digest(side) == stale_again,
               "an existing backup is never overwritten")
         os.remove(side + BAK_SUFFIX)
@@ -2406,7 +2450,13 @@ def self_test():
               "a failed write leaves the old sidecar whole")
         check([n for n in os.listdir(wdir) if n.endswith(".tmp")] == [],
               "and removes its temporary file")
-        check(code == 1, "a stale raster whose write failed still exits 1")
+        check(code == 2, "a stale raster whose write failed exits 2, not 1"
+              "  <-- pinned defect")
+        check(not os.path.exists(side + BAK_SUFFIX),
+              "a failed write removes the backup it made  <-- pinned defect")
+        code, out, err = run([wat("stale.tif"), "--apply"])
+        check(code == 0 and "apply: refreshed" in out,
+              "and the next --apply, with the cause gone, works")
 
         # ---- a write that failed is a tool failure, exit 2
         fdir = at("failed")
@@ -2451,6 +2501,29 @@ def self_test():
             check(run([ldir, "--apply"] + extra)[0] == want_code,
                   "a refresh that took the NoData value as right exits %d%s"
                   % (want_code, " under --strict" if extra else ""))
+
+        # ---- the tolerance follows the data range
+        trows = [[-1000, 1000, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]]
+        tflat = [v for r in trows for v in r]
+        for mean_text, want_code in (("0.0005", OK), ("0.005", FAIL)):
+            tpath = at("tolr%s.tif" % want_code)
+            make_tiff(tpath, trows, bits=16, fmt=2)
+            make_sidecar(tpath, dict(good_items(tflat), **{K_MEAN: mean_text}))
+            check(check_file(tpath)["verdict"] == want_code,
+                  "a stored mean %s off on a range of 2000 is %s: the "
+                  "tolerance is 1e-6 of the range" % (mean_text, want_code))
+
+        # ---- --json is strict JSON
+        make_tiff(at("jsnan.tif"), [[1.0, float("nan"), 3.0]], bits=32, fmt=3,
+                  nodata="nan")
+        make_sidecar(at("jsnan.tif"), {K_MIN: "-inf", K_MEAN: "inf"})
+        code, out, err = run([at("jsnan.tif"), "--json"])
+        doc = json.loads(out)["files"][0]
+        check(doc["nodata"] == "nan" and doc["stored"][K_MIN] == "-inf"
+              and doc["stored"][K_MEAN] == "inf" and doc["valid_cells"] == 2
+              and not any(bare in out for bare in ("NaN", "Infinity")),
+              "--json writes NaN and infinity as strings, so strict parsers "
+              "read it  <-- pinned defect")
 
         # ---- text of the reports
         check(describe({"verdict": UNREADABLE, "path": "p", "reason": "r"})
